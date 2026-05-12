@@ -467,6 +467,12 @@ async def login(req: LoginRequest):
     if not verify_password(req.password, user_doc["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
+    # Auto-promote: if email is in ADMIN_EMAILS but user's is_admin is False, fix it.
+    email_lower = user_doc.get("email", "").lower()
+    if email_lower in ADMIN_EMAILS and not user_doc.get("is_admin"):
+        await db.users.update_one({"user_id": user_doc["user_id"]}, {"$set": {"is_admin": True}})
+        user_doc["is_admin"] = True
+
     if isinstance(user_doc.get("created_at"), str):
         user_doc["created_at"] = datetime.fromisoformat(user_doc["created_at"])
     token = create_jwt(user_doc["user_id"])
@@ -542,6 +548,10 @@ async def google_session(request: Request, response: Response):
 
 @api_router.get("/auth/me", response_model=User)
 async def me(user: User = Depends(get_current_user)):
+    # Auto-promote: if user's email is in ADMIN_EMAILS but DB has is_admin=False, fix it.
+    if user.email.lower() in ADMIN_EMAILS and not user.is_admin:
+        await db.users.update_one({"user_id": user.user_id}, {"$set": {"is_admin": True}})
+        user.is_admin = True
     return user
 
 
@@ -687,6 +697,7 @@ _SETTINGS_ID = "company_settings"
 _EDITABLE_KEYS = {
     "upi_id", "upi_name", "qr_image_url", "price_inr", "referral_price_inr",
     "payment_methods", "primary_phone", "whatsapp",
+    "razorpay_key_id", "razorpay_key_secret", "razorpay_enabled",
 }
 
 # Default list of accepted payment methods (admin can edit)
@@ -969,6 +980,9 @@ class SettingsUpdate(BaseModel):
     payment_methods: Optional[List[str]] = None
     primary_phone: Optional[str] = None
     whatsapp: Optional[str] = None
+    razorpay_key_id: Optional[str] = None
+    razorpay_key_secret: Optional[str] = None
+    razorpay_enabled: Optional[bool] = None
 
 
 @api_router.get("/admin/settings")
