@@ -1,7 +1,7 @@
 """
 Loan DPR & CMA Preparation Software - Backend API
 """
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, Cookie
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, Cookie, Query
 from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -39,6 +39,9 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
+# Source-code download directory (admin can download backend/frontend zips from /api/downloads/...)
+DOWNLOADS_DIR = Path("/app/build/downloads")
+
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
@@ -66,6 +69,8 @@ class User(BaseModel):
     wallet_balance: float = 0.0  # INR balance — usable to pay for DPRs
     is_guest: bool = False  # true for no-password "Quick Buy" accounts; pricing falls back to base_price
     is_admin: bool = False
+    is_blocked: bool = False  # admin can block a user; blocked users cannot login or access API
+    mobile: Optional[str] = ""
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -404,6 +409,8 @@ async def get_current_user(
                 raise HTTPException(status_code=401, detail="Token revoked")
             user_doc = await db.users.find_one({"user_id": payload["user_id"]}, {"_id": 0})
             if user_doc:
+                if user_doc.get("is_blocked") and not user_doc.get("is_admin"):
+                    raise HTTPException(status_code=403, detail="Account blocked")
                 if isinstance(user_doc.get("created_at"), str):
                     user_doc["created_at"] = datetime.fromisoformat(user_doc["created_at"])
                 return User(**user_doc)
@@ -458,6 +465,7 @@ async def register(req: RegisterRequest):
         "wallet_balance": 0.0,
         "is_guest": False,
         "is_admin": is_admin,
+        "is_blocked": False,
         "created_at": now.isoformat(),
     }
     await db.users.insert_one(user_doc)
@@ -478,6 +486,8 @@ async def login(req: LoginRequest):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     if not verify_password(req.password, user_doc["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
+    if user_doc.get("is_blocked"):
+        raise HTTPException(status_code=403, detail="Your account has been blocked. Please contact support.")
 
     # Auto-promote: if email is in ADMIN_EMAILS but user's is_admin is False, fix it.
     email_lower = user_doc.get("email", "").lower()
@@ -697,6 +707,9 @@ COMPANY_INFO = {
     "referral_price_inr": 599,
     "referral_reward_text": "Refer a friend — when they sign up using your code, they get 1 free DPR (with DPRForge watermark). Their first paid DPR earns you a ₹200 wallet credit.",
     "tagline": "Loan DPR & CMA Reports made simple.",
+    "razorpay_key_id": "",
+    "razorpay_key_secret": "",
+    "razorpay_enabled": False,
 }
 
 ADMIN_EMAILS = [e.strip().lower() for e in os.environ.get("ADMIN_EMAILS", "motherblessopc@gmail.com,admin@motherbless.in,7300213623@motherbless.in").split(",") if e.strip()]
@@ -897,6 +910,70 @@ async def require_admin(user: User = Depends(get_current_user)) -> User:
     raise HTTPException(status_code=403, detail="Admin access required")
 
 
+# ---------- Admin audit log helper ----------
+
+async def log_admin_action(
+    admin: User,
+    action: str,
+    target_type: str = "",
+    target_id: str = "",
+    details: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Record a mutating admin action for the audit trail. Never raises."""
+    try:
+        await db.admin_audit_logs.insert_one({
+            "log_id": f"audit_{uuid.uuid4().hex[:12]}",
+            "admin_user_id": admin.user_id,
+            "admin_email": admin.email,
+            "action": action,
+            "target_type": target_type,
+            "target_id": target_id,
+            "details": details or {},
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as e:
+        logger.warning(f"[audit] Failed to record action {action}: {e}")
+
+
+@api_router.get("/admin/audit-logs")
+async def admin_list_audit_logs(
+    _: User = Depends(require_admin),
+    action: Optional[str] = None,
+    target_type: Optional[str] = None,
+    limit: int = 200,
+):
+    q: Dict[str, Any] = {}
+    if action:
+        q["action"] = action
+    if target_type:
+        q["target_type"] = target_type
+    limit = max(1, min(int(limit or 200), 1000))
+    rows = await db.admin_audit_logs.find(q, {"_id": 0}).sort("created_at", -1).to_list(limit)
+    return rows
+
+
+@api_router.get("/admin/source-zip/{kind}")
+async def admin_download_source_zip(kind: str, admin: User = Depends(require_admin)):
+    """Admin can download the latest backend / frontend / full source zip."""
+    mapping = {
+        "backend": "dprforge-backend.zip",
+        "frontend": "dprforge-frontend.zip",
+        "full": "dprforge-full.zip",
+    }
+    fname = mapping.get(kind.lower())
+    if not fname:
+        raise HTTPException(status_code=404, detail="Unknown zip kind")
+    path = DOWNLOADS_DIR / fname
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Source zip not generated yet")
+    await log_admin_action(admin, "source.download", "source", kind, {"filename": fname})
+    return StreamingResponse(
+        open(path, "rb"),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
 @api_router.get("/admin/payments")
 async def admin_payments(_: User = Depends(require_admin), status: Optional[str] = None):
     q = {}
@@ -924,6 +1001,11 @@ async def admin_verify(log_id: str, admin: User = Depends(require_admin)):
         {"log_id": log_id},
         {"$set": {"verification_status": "verified", "verified_by": admin.email, "verified_at": now}},
     )
+    await log_admin_action(admin, "payment.verify", "payment", log_id, {
+        "user_email": log.get("user_email"),
+        "amount": log.get("amount"),
+        "txn_id": log.get("txn_id"),
+    })
     return {"ok": True}
 
 
@@ -942,6 +1024,11 @@ async def admin_reject(log_id: str, admin: User = Depends(require_admin)):
         {"project_id": log["project_id"]},
         {"$set": {"payment_status": "unpaid", "updated_at": now}},
     )
+    await log_admin_action(admin, "payment.reject", "payment", log_id, {
+        "user_email": log.get("user_email"),
+        "amount": log.get("amount"),
+        "txn_id": log.get("txn_id"),
+    })
     return {"ok": True}
 
 
@@ -1012,6 +1099,9 @@ async def admin_update_settings(payload: SettingsUpdate, admin: User = Depends(r
     data["updated_at"] = datetime.now(timezone.utc).isoformat()
     data["updated_by"] = admin.email
     await db.settings.update_one({"_id": _SETTINGS_ID}, {"$set": data}, upsert=True)
+    await log_admin_action(admin, "settings.update", "settings", _SETTINGS_ID, {
+        "fields": list(data.keys()),
+    })
     return await get_company_settings()
 
 
@@ -1027,9 +1117,9 @@ async def admin_list_inquiries(_: User = Depends(require_admin), status: Optiona
 
 
 @api_router.post("/admin/inquiries/{inquiry_id}/status")
-async def admin_update_inquiry_status(inquiry_id: str, payload: Dict[str, Any], _: User = Depends(require_admin)):
+async def admin_update_inquiry_status(inquiry_id: str, payload: Dict[str, Any], admin: User = Depends(require_admin)):
     status = (payload.get("status") or "").strip().lower()
-    if status not in {"new", "contacted", "converted", "closed"}:
+    if status not in {"new", "processing", "completed", "contacted", "converted", "closed"}:
         raise HTTPException(status_code=400, detail="Invalid status")
     r = await db.inquiries.update_one(
         {"inquiry_id": inquiry_id},
@@ -1037,7 +1127,462 @@ async def admin_update_inquiry_status(inquiry_id: str, payload: Dict[str, Any], 
     )
     if r.matched_count == 0:
         raise HTTPException(status_code=404, detail="Inquiry not found")
+    await log_admin_action(admin, "inquiry.status", "inquiry", inquiry_id, {"status": status})
     return {"ok": True}
+
+
+# ---------- Admin: User block/unblock + search ----------
+
+@api_router.post("/admin/users/{user_id}/block")
+async def admin_block_user(user_id: str, admin: User = Depends(require_admin)):
+    target = await db.users.find_one({"user_id": user_id}, {"_id": 0})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if target.get("is_admin"):
+        raise HTTPException(status_code=400, detail="Cannot block an admin account")
+    await db.users.update_one({"user_id": user_id}, {"$set": {"is_blocked": True}})
+    await log_admin_action(admin, "user.block", "user", user_id, {"email": target.get("email")})
+    return {"ok": True, "user_id": user_id, "is_blocked": True}
+
+
+@api_router.post("/admin/users/{user_id}/unblock")
+async def admin_unblock_user(user_id: str, admin: User = Depends(require_admin)):
+    target = await db.users.find_one({"user_id": user_id}, {"_id": 0})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    await db.users.update_one({"user_id": user_id}, {"$set": {"is_blocked": False}})
+    await log_admin_action(admin, "user.unblock", "user", user_id, {"email": target.get("email")})
+    return {"ok": True, "user_id": user_id, "is_blocked": False}
+
+
+@api_router.delete("/admin/users/{user_id}")
+async def admin_delete_user(user_id: str, admin: User = Depends(require_admin)):
+    target = await db.users.find_one({"user_id": user_id}, {"_id": 0})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if target.get("is_admin"):
+        raise HTTPException(status_code=400, detail="Cannot delete an admin account")
+    await db.users.delete_one({"user_id": user_id})
+    await log_admin_action(admin, "user.delete", "user", user_id, {"email": target.get("email")})
+    return {"ok": True}
+
+
+# ---------- Admin: DPR Templates (sample/ready-made DPRs available for purchase) ----------
+
+import base64
+
+class DPRTemplateCreate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    title: str = Field(..., min_length=2, max_length=200)
+    description: str = ""
+    category: str = ""
+    price_inr: int = 0
+    is_active: bool = True
+    pdf_base64: Optional[str] = None  # raw base64 (without data: prefix)
+    pdf_filename: Optional[str] = None
+
+
+class DPRTemplateUpdate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    title: Optional[str] = None
+    description: Optional[str] = None
+    category: Optional[str] = None
+    price_inr: Optional[int] = None
+    is_active: Optional[bool] = None
+    pdf_base64: Optional[str] = None
+    pdf_filename: Optional[str] = None
+
+
+def _serialize_dpr(doc: dict) -> dict:
+    """Return DPR template doc without the heavy pdf_data field."""
+    return {
+        "dpr_id": doc.get("dpr_id"),
+        "title": doc.get("title"),
+        "description": doc.get("description", ""),
+        "category": doc.get("category", ""),
+        "price_inr": doc.get("price_inr", 0),
+        "is_active": doc.get("is_active", True),
+        "pdf_filename": doc.get("pdf_filename", ""),
+        "has_pdf": bool(doc.get("pdf_data")),
+        "pdf_size_kb": round((len(doc.get("pdf_data", "")) * 3 / 4) / 1024, 1) if doc.get("pdf_data") else 0,
+        "created_at": doc.get("created_at"),
+        "updated_at": doc.get("updated_at"),
+    }
+
+
+@api_router.get("/admin/dprs")
+async def admin_list_dprs(_: User = Depends(require_admin)):
+    rows = await db.dpr_templates.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    return [_serialize_dpr(r) for r in rows]
+
+
+@api_router.post("/admin/dprs")
+async def admin_create_dpr(payload: DPRTemplateCreate, admin: User = Depends(require_admin)):
+    if payload.price_inr < 0:
+        raise HTTPException(status_code=400, detail="Price must be >= 0")
+    dpr_id = f"dpr_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    pdf_data = (payload.pdf_base64 or "").strip()
+    # Strip data: URI prefix if present
+    if pdf_data.startswith("data:"):
+        comma = pdf_data.find(",")
+        if comma >= 0:
+            pdf_data = pdf_data[comma + 1:]
+    # Validate base64 (best-effort)
+    if pdf_data:
+        try:
+            base64.b64decode(pdf_data, validate=False)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid PDF data")
+    doc = {
+        "dpr_id": dpr_id,
+        "title": payload.title.strip(),
+        "description": (payload.description or "").strip(),
+        "category": (payload.category or "").strip(),
+        "price_inr": int(payload.price_inr),
+        "is_active": bool(payload.is_active),
+        "pdf_filename": (payload.pdf_filename or "").strip(),
+        "pdf_data": pdf_data,
+        "created_at": now,
+        "updated_at": now,
+        "created_by": admin.email,
+    }
+    await db.dpr_templates.insert_one(doc)
+    await log_admin_action(admin, "dpr.create", "dpr", dpr_id, {"title": doc["title"], "price_inr": doc["price_inr"]})
+    return _serialize_dpr(doc)
+
+
+@api_router.put("/admin/dprs/{dpr_id}")
+async def admin_update_dpr(dpr_id: str, payload: DPRTemplateUpdate, admin: User = Depends(require_admin)):
+    existing = await db.dpr_templates.find_one({"dpr_id": dpr_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="DPR template not found")
+    data = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if "price_inr" in data and data["price_inr"] < 0:
+        raise HTTPException(status_code=400, detail="Price must be >= 0")
+    if "pdf_base64" in data:
+        pdf_data = (data.pop("pdf_base64") or "").strip()
+        if pdf_data.startswith("data:"):
+            comma = pdf_data.find(",")
+            if comma >= 0:
+                pdf_data = pdf_data[comma + 1:]
+        data["pdf_data"] = pdf_data
+    data["updated_at"] = datetime.now(timezone.utc).isoformat()
+    data["updated_by"] = admin.email
+    await db.dpr_templates.update_one({"dpr_id": dpr_id}, {"$set": data})
+    refreshed = await db.dpr_templates.find_one({"dpr_id": dpr_id}, {"_id": 0})
+    await log_admin_action(admin, "dpr.update", "dpr", dpr_id, {"fields": list(data.keys())})
+    return _serialize_dpr(refreshed)
+
+
+@api_router.delete("/admin/dprs/{dpr_id}")
+async def admin_delete_dpr(dpr_id: str, admin: User = Depends(require_admin)):
+    existing = await db.dpr_templates.find_one({"dpr_id": dpr_id}, {"_id": 0, "title": 1})
+    r = await db.dpr_templates.delete_one({"dpr_id": dpr_id})
+    if r.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="DPR template not found")
+    await log_admin_action(admin, "dpr.delete", "dpr", dpr_id, {"title": (existing or {}).get("title")})
+    return {"ok": True}
+
+
+@api_router.get("/dprs")
+async def public_list_dprs():
+    """Public endpoint — list all active DPR templates available for purchase."""
+    rows = await db.dpr_templates.find({"is_active": True}, {"_id": 0, "pdf_data": 0}).sort("created_at", -1).to_list(500)
+    return [
+        {
+            "dpr_id": r.get("dpr_id"),
+            "title": r.get("title"),
+            "description": r.get("description", ""),
+            "category": r.get("category", ""),
+            "price_inr": r.get("price_inr", 0),
+            "pdf_filename": r.get("pdf_filename", ""),
+            "has_pdf": True,
+        }
+        for r in rows
+    ]
+
+
+@api_router.get("/dprs/{dpr_id}/pdf")
+async def download_dpr_pdf(dpr_id: str):
+    """Public download of the DPR sample PDF. Anyone with the link can download
+    (the admin controls visibility via is_active)."""
+    doc = await db.dpr_templates.find_one({"dpr_id": dpr_id, "is_active": True}, {"_id": 0})
+    if not doc or not doc.get("pdf_data"):
+        raise HTTPException(status_code=404, detail="DPR not found")
+    try:
+        binary = base64.b64decode(doc["pdf_data"])
+    except Exception:
+        raise HTTPException(status_code=500, detail="Corrupt PDF data")
+    filename = doc.get("pdf_filename") or f"{(doc.get('title') or 'dpr').replace(' ', '_')}.pdf"
+    return StreamingResponse(
+        io.BytesIO(binary),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+    )
+
+
+# ---------- Admin: Analytics (sales & user growth) ----------
+
+def _resolve_date_range(days: Optional[int], from_str: Optional[str], to_str: Optional[str]) -> tuple:
+    """Resolve a date range from either explicit from/to or a `days` count.
+    Returns (start_date, end_date) as `date` objects (both inclusive)."""
+    today = datetime.now(timezone.utc).date()
+    if from_str or to_str:
+        try:
+            start = datetime.fromisoformat(from_str).date() if from_str else today - timedelta(days=29)
+            end = datetime.fromisoformat(to_str).date() if to_str else today
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format — expected YYYY-MM-DD")
+        if start > end:
+            raise HTTPException(status_code=400, detail="`from` must be <= `to`")
+        # cap to 365 days to avoid huge payloads
+        if (end - start).days > 365:
+            raise HTTPException(status_code=400, detail="Date range too wide (max 365 days)")
+        return start, end
+    d = max(1, min(int(days or 30), 365))
+    return today - timedelta(days=d - 1), today
+
+
+@api_router.get("/admin/analytics/sales")
+async def admin_analytics_sales(
+    days: Optional[int] = 30,
+    from_: Optional[str] = Query(None, alias="from"),
+    to: Optional[str] = None,
+    _: User = Depends(require_admin),
+):
+    """Return daily revenue (verified + pending UPI payments, excluding rejected).
+
+    Accepts either `days` or explicit `from` / `to` query params (YYYY-MM-DD)."""
+    start, end = _resolve_date_range(days, from_, to)
+    cursor = db.payment_logs.find(
+        {"verification_status": {"$ne": "rejected"}},
+        {"_id": 0, "amount": 1, "submitted_at": 1, "verification_status": 1},
+    )
+    docs = await cursor.to_list(20000)
+    by_day = {}
+    span = (end - start).days + 1
+    for i in range(span):
+        d = start + timedelta(days=i)
+        by_day[d.isoformat()] = {"date": d.isoformat(), "revenue": 0.0, "verified": 0.0, "pending": 0.0, "count": 0}
+    for d in docs:
+        s = d.get("submitted_at")
+        if not s:
+            continue
+        try:
+            dt = datetime.fromisoformat(s) if isinstance(s, str) else s
+        except Exception:
+            continue
+        day_key = dt.date().isoformat()
+        if day_key not in by_day:
+            continue
+        amt = float(d.get("amount") or 0)
+        by_day[day_key]["revenue"] += amt
+        by_day[day_key]["count"] += 1
+        if d.get("verification_status") == "verified":
+            by_day[day_key]["verified"] += amt
+        else:
+            by_day[day_key]["pending"] += amt
+    series = list(by_day.values())
+    total = sum(x["revenue"] for x in series)
+    return {"days": span, "from": start.isoformat(), "to": end.isoformat(), "total_revenue": total, "series": series}
+
+
+@api_router.get("/admin/analytics/user-growth")
+async def admin_analytics_user_growth(
+    days: Optional[int] = 30,
+    from_: Optional[str] = Query(None, alias="from"),
+    to: Optional[str] = None,
+    _: User = Depends(require_admin),
+):
+    """Return daily user signups. Accepts either `days` or `from`/`to`."""
+    start, end = _resolve_date_range(days, from_, to)
+    cursor = db.users.find({}, {"_id": 0, "created_at": 1, "is_guest": 1})
+    docs = await cursor.to_list(50000)
+    by_day = {}
+    span = (end - start).days + 1
+    for i in range(span):
+        d = start + timedelta(days=i)
+        by_day[d.isoformat()] = {"date": d.isoformat(), "signups": 0, "guests": 0, "registered": 0}
+    for d in docs:
+        s = d.get("created_at")
+        if not s:
+            continue
+        try:
+            dt = datetime.fromisoformat(s) if isinstance(s, str) else s
+        except Exception:
+            continue
+        day_key = dt.date().isoformat()
+        if day_key not in by_day:
+            continue
+        by_day[day_key]["signups"] += 1
+        if d.get("is_guest"):
+            by_day[day_key]["guests"] += 1
+        else:
+            by_day[day_key]["registered"] += 1
+    series = list(by_day.values())
+    total_users = await db.users.count_documents({})
+    return {"days": span, "from": start.isoformat(), "to": end.isoformat(), "total_users": total_users, "series": series}
+
+
+# ---------- Admin: Excel Exports (Payment Statement + Sales Report) ----------
+
+@api_router.get("/admin/exports/payments.xlsx")
+async def admin_export_payments_xlsx(
+    from_: Optional[str] = Query(None, alias="from"),
+    to: Optional[str] = None,
+    status: Optional[str] = None,
+    admin: User = Depends(require_admin),
+):
+    """Download an Excel statement of every payment log within the date range."""
+    start, end = _resolve_date_range(None, from_, to)
+    q: Dict[str, Any] = {}
+    if status:
+        q["verification_status"] = status.strip().lower()
+    docs = await db.payment_logs.find(q, {"_id": 0}).sort("submitted_at", -1).to_list(20000)
+    # Filter by date range (best-effort, on isoformat strings)
+    def _in_range(s: Any) -> bool:
+        if not s:
+            return False
+        try:
+            d = datetime.fromisoformat(s) if isinstance(s, str) else s
+        except Exception:
+            return False
+        return start <= d.date() <= end
+    docs = [d for d in docs if _in_range(d.get("submitted_at"))]
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Payment Statement"
+    header = ["Date", "User Email", "Project ID", "TXN / UTR", "Method", "Amount (₹)", "Status", "Verified by", "Verified at"]
+    ws.append(header)
+    bold = Font(bold=True, color="FFFFFF")
+    fill = PatternFill(start_color="0F172A", end_color="0F172A", fill_type="solid")
+    for col, _h in enumerate(header, start=1):
+        c = ws.cell(row=1, column=col)
+        c.font = bold
+        c.fill = fill
+        c.alignment = Alignment(horizontal="left")
+    total = 0.0
+    verified_total = 0.0
+    for d in docs:
+        amt = float(d.get("amount") or 0)
+        total += amt
+        if d.get("verification_status") == "verified":
+            verified_total += amt
+        ws.append([
+            (d.get("submitted_at") or "")[:19].replace("T", " "),
+            d.get("user_email") or "",
+            d.get("project_id") or "",
+            d.get("txn_id") or "",
+            d.get("method") or "",
+            amt,
+            d.get("verification_status") or "",
+            d.get("verified_by") or "",
+            (d.get("verified_at") or "")[:19].replace("T", " "),
+        ])
+    # Totals row
+    ws.append([])
+    ws.append(["", "", "", "", "TOTAL", total])
+    ws.append(["", "", "", "", "VERIFIED TOTAL", verified_total])
+    last = ws.max_row
+    for cell in ws[last - 1]:
+        cell.font = Font(bold=True)
+    for cell in ws[last]:
+        cell.font = Font(bold=True, color="047857")
+    # Auto-size columns
+    widths = [22, 32, 22, 26, 12, 14, 12, 28, 20]
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[chr(64 + i)].width = w
+
+    await log_admin_action(admin, "export.payments", "export", "", {"from": start.isoformat(), "to": end.isoformat(), "rows": len(docs)})
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    fname = f"PaymentStatement_{start.isoformat()}_to_{end.isoformat()}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+@api_router.get("/admin/exports/sales.xlsx")
+async def admin_export_sales_xlsx(
+    from_: Optional[str] = Query(None, alias="from"),
+    to: Optional[str] = None,
+    admin: User = Depends(require_admin),
+):
+    """Day-wise sales summary as Excel."""
+    start, end = _resolve_date_range(None, from_, to)
+    cursor = db.payment_logs.find(
+        {"verification_status": {"$ne": "rejected"}},
+        {"_id": 0, "amount": 1, "submitted_at": 1, "verification_status": 1},
+    )
+    docs = await cursor.to_list(20000)
+    by_day: Dict[str, Dict[str, float]] = {}
+    span = (end - start).days + 1
+    for i in range(span):
+        d = start + timedelta(days=i)
+        by_day[d.isoformat()] = {"verified": 0.0, "pending": 0.0, "count": 0}
+    for d in docs:
+        s = d.get("submitted_at")
+        if not s:
+            continue
+        try:
+            dt = datetime.fromisoformat(s) if isinstance(s, str) else s
+        except Exception:
+            continue
+        key = dt.date().isoformat()
+        if key not in by_day:
+            continue
+        amt = float(d.get("amount") or 0)
+        by_day[key]["count"] += 1
+        if d.get("verification_status") == "verified":
+            by_day[key]["verified"] += amt
+        else:
+            by_day[key]["pending"] += amt
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Sales Report"
+    header = ["Date", "Transactions", "Verified (₹)", "Pending (₹)", "Total (₹)"]
+    ws.append(header)
+    bold = Font(bold=True, color="FFFFFF")
+    fill = PatternFill(start_color="0F172A", end_color="0F172A", fill_type="solid")
+    for col, _h in enumerate(header, start=1):
+        c = ws.cell(row=1, column=col)
+        c.font = bold
+        c.fill = fill
+    total_v = 0.0
+    total_p = 0.0
+    total_c = 0
+    for day_key in sorted(by_day.keys()):
+        row = by_day[day_key]
+        ws.append([day_key, row["count"], row["verified"], row["pending"], row["verified"] + row["pending"]])
+        total_v += row["verified"]
+        total_p += row["pending"]
+        total_c += int(row["count"])
+    ws.append([])
+    ws.append(["TOTAL", total_c, total_v, total_p, total_v + total_p])
+    for cell in ws[ws.max_row]:
+        cell.font = Font(bold=True, color="047857")
+    widths = [14, 14, 16, 16, 16]
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[chr(64 + i)].width = w
+
+    await log_admin_action(admin, "export.sales", "export", "", {"from": start.isoformat(), "to": end.isoformat()})
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    fname = f"SalesReport_{start.isoformat()}_to_{end.isoformat()}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
 
 
 
@@ -2030,9 +2575,12 @@ async def download_excel(project_id: str, user: User = Depends(get_current_user)
     # Sheet 1: Project Overview
     ws = wb.active
     ws.title = "Overview"
-    ws["A1"] = "DETAILED PROJECT REPORT"
+    ws["A1"] = "DETAILED PROJECT REPORT (DPR) & CMA"
     ws["A1"].font = Font(bold=True, size=16)
     ws.merge_cells("A1:D1")
+    ws["A2"] = "Government & Bank Approved Format · Compliant with PMEGP / Mudra / Stand-Up India / NABARD · RBI Nayak Committee WC methodology"
+    ws["A2"].font = Font(italic=True, size=9, color="92400E")
+    ws.merge_cells("A2:D2")
     rows = [
         ("Business Name", p.business_name),
         ("Business Type", p.business_type),
@@ -2043,7 +2591,7 @@ async def download_excel(project_id: str, user: User = Depends(get_current_user)
         ("Loan Amount", _fmt_inr(p.loan_amount)),
         ("Projection Years", p.projection_years),
     ]
-    for i, (k, v) in enumerate(rows, start=3):
+    for i, (k, v) in enumerate(rows, start=4):
         ws.cell(row=i, column=1, value=k).font = Font(bold=True)
         ws.cell(row=i, column=2, value=v)
     ws.column_dimensions["A"].width = 25
@@ -2282,7 +2830,19 @@ async def download_pdf(project_id: str, user: User = Depends(get_current_user)):
                           fontSize=10, leading=14, textColor=colors.HexColor("#0F172A"))
 
     story = []
-    story.append(Paragraph("DETAILED PROJECT REPORT", title_style))
+    # Government / Bank approved compliance banner
+    compliance_banner = ParagraphStyle(
+        "ComplianceBanner", parent=styles["Normal"],
+        fontSize=8, textColor=colors.HexColor("#92400E"),
+        alignment=1, spaceAfter=4, leading=10,
+    )
+    story.append(Paragraph(
+        "<b>GOVERNMENT &amp; BANK APPROVED FORMAT</b> &nbsp;|&nbsp; "
+        "Compliant with PMEGP / Mudra / Stand-Up India / NABARD guidelines &nbsp;|&nbsp; "
+        "Prepared as per RBI Nayak Committee methodology for Working Capital assessment",
+        compliance_banner,
+    ))
+    story.append(Paragraph("DETAILED PROJECT REPORT (DPR) &amp; CREDIT MONITORING ARRANGEMENT (CMA)", title_style))
     story.append(Paragraph(p.business_name or "Untitled Project", sub_style))
 
     # Applicant block (if filled)
@@ -2893,6 +3453,11 @@ async def admin_wallet_credit(payload: AdminWalletCredit, admin: User = Depends(
         "created_at": now,
     })
     new_doc = await db.users.find_one({"user_id": target["user_id"]}, {"_id": 0, "wallet_balance": 1, "email": 1})
+    await log_admin_action(admin, "wallet.credit", "user", target["user_id"], {
+        "email": target["email"],
+        "amount": float(payload.amount),
+        "note": payload.note or "",
+    })
     return {"ok": True, "email": new_doc["email"], "balance": float(new_doc["wallet_balance"])}
 
 
@@ -2904,6 +3469,13 @@ async def admin_list_users(_: User = Depends(require_admin)):
     for r in rows:
         if isinstance(r.get("created_at"), str):
             r["created_at"] = r["created_at"]
+        r.setdefault("is_blocked", False)
+        r.setdefault("is_admin", False)
+        r.setdefault("is_guest", False)
+        r.setdefault("wallet_balance", 0.0)
+        r.setdefault("free_dpr_credits", 0)
+        r.setdefault("referral_code", "")
+        r.setdefault("mobile", "")
     return rows
 
 
