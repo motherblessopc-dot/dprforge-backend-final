@@ -58,10 +58,13 @@ class User(BaseModel):
     email: EmailStr
     name: str
     picture: Optional[str] = None
-    auth_provider: Literal["email", "google"] = "email"
+    auth_provider: Literal["email", "google", "guest"] = "email"
     referral_code: str = ""
     referred_by: str = ""
     referral_credits: int = 0  # number of ₹500-discount credits available
+    free_dpr_credits: int = 0  # number of free WATERMARKED DPR downloads (earned after first paid subscription via referral)
+    wallet_balance: float = 0.0  # INR balance — usable to pay for DPRs
+    is_guest: bool = False  # true for no-password "Quick Buy" accounts; pricing falls back to base_price
     is_admin: bool = False
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -270,6 +273,9 @@ class ProjectCreate(BaseModel):
     business_stage: str = "new"
     industry_template: str = ""
     loan_amount: float = 0
+    interest_rate: float = 11.0
+    loan_tenure_years: int = 7
+    moratorium_months: int = 6
 
 
 class ProjectUpdate(BaseModel):
@@ -433,6 +439,8 @@ async def register(req: RegisterRequest):
         ref_user = await db.users.find_one({"referral_code": rc}, {"_id": 0, "user_id": 1})
         if ref_user:
             referred_by = rc
+            # Note: free_dpr_credits is awarded AFTER the user subscribes (makes first payment),
+            # NOT immediately on signup. See submit_payment / pay_from_wallet.
 
     is_admin = req.email.lower() in ADMIN_EMAILS
 
@@ -446,6 +454,9 @@ async def register(req: RegisterRequest):
         "referral_code": referral_code,
         "referred_by": referred_by,
         "referral_credits": 0,
+        "free_dpr_credits": 0,
+        "wallet_balance": 0.0,
+        "is_guest": False,
         "is_admin": is_admin,
         "created_at": now.isoformat(),
     }
@@ -454,7 +465,8 @@ async def register(req: RegisterRequest):
     return AuthResponse(
         user=User(user_id=user_id, email=req.email.lower(), name=req.name,
                   auth_provider="email", referral_code=referral_code,
-                  referred_by=referred_by, is_admin=is_admin, created_at=now),
+                  referred_by=referred_by, free_dpr_credits=0,
+                  is_admin=is_admin, created_at=now),
         token=token,
     )
 
@@ -682,8 +694,8 @@ COMPANY_INFO = {
     "upi_name": "Mother Bless Digital Solutions",
     "qr_image_url": "/payment-qr.jpg",
     "price_inr": 799,
-    "referral_price_inr": 500,
-    "referral_reward_text": "Refer a friend — when they buy their first DPR, you get your next DPR at ₹500 (instead of ₹799). Limited to 1 DPR per referral.",
+    "referral_price_inr": 599,
+    "referral_reward_text": "Refer a friend — when they sign up using your code, they get 1 free DPR (with DPRForge watermark). Their first paid DPR earns you a ₹200 wallet credit.",
     "tagline": "Loan DPR & CMA Reports made simple.",
 }
 
@@ -722,18 +734,30 @@ async def get_company():
 
 @api_router.get("/projects/{project_id}/pricing")
 async def get_pricing(project_id: str, user: User = Depends(get_current_user)):
-    """Return the effective price for THIS user on THIS project."""
+    """Return the effective price for THIS user on THIS project.
+    - Logged-in (non-guest) users always get the bulk/premium price (referral_price_inr).
+    - Guest accounts (auth_provider='guest', is_guest=True) pay the base_price (799).
+    Free watermarked credits are reported separately so the frontend can show 'free preview' option.
+    """
     user_doc = await db.users.find_one({"user_id": user.user_id}, {"_id": 0})
     credits = (user_doc or {}).get("referral_credits", 0)
+    free_dpr = (user_doc or {}).get("free_dpr_credits", 0)
+    wallet = float((user_doc or {}).get("wallet_balance", 0))
+    is_guest = bool((user_doc or {}).get("is_guest", False))
     settings = await get_company_settings()
-    base = int(settings["price_inr"])
-    discounted = int(settings["referral_price_inr"])
+    base = int(settings["price_inr"])           # 799 — guest one-time
+    bulk = int(settings["referral_price_inr"])  # 599 — logged-in bulk
+    your_price = base if is_guest else bulk
     return {
         "base_price": base,
-        "discounted_price": discounted,
-        "your_price": discounted if credits > 0 else base,
+        "discounted_price": bulk,
+        "your_price": your_price,
+        "is_guest": is_guest,
         "has_referral_credit": credits > 0,
         "referral_credits": credits,
+        "free_dpr_credits": free_dpr,
+        "wallet_balance": wallet,
+        "can_pay_from_wallet": wallet >= your_price,
     }
 
 
@@ -746,10 +770,12 @@ async def submit_payment(project_id: str, payload: PaymentSubmit, user: User = D
         raise HTTPException(status_code=400, detail="Valid transaction ID required")
 
     user_doc = await db.users.find_one({"user_id": user.user_id}, {"_id": 0})
+    is_guest = bool((user_doc or {}).get("is_guest", False))
     has_credit = (user_doc or {}).get("referral_credits", 0) > 0
     settings = await get_company_settings()
-    expected_price = int(settings["referral_price_inr"]) if has_credit else int(settings["price_inr"])
-    used_credit = has_credit
+    # Guests pay base (799); logged-in users pay bulk (599)
+    expected_price = int(settings["price_inr"]) if is_guest else int(settings["referral_price_inr"])
+    used_credit = False
 
     now = datetime.now(timezone.utc)
     update = {
@@ -764,29 +790,8 @@ async def submit_payment(project_id: str, payload: PaymentSubmit, user: User = D
         {"project_id": project_id, "user_id": user.user_id}, {"$set": update}
     )
 
-    # Consume referral credit (if used)
-    if used_credit:
-        await db.users.update_one(
-            {"user_id": user.user_id},
-            {"$inc": {"referral_credits": -1}},
-        )
-
-    # First-time payment by this user → reward the referrer (if any), one-time
-    paid_count = await db.projects.count_documents({
-        "user_id": user.user_id, "payment_status": "paid"
-    })
-    referred_by = (user_doc or {}).get("referred_by", "")
-    referral_rewarded = (user_doc or {}).get("referral_rewarded", False)
-    if paid_count == 1 and referred_by and not referral_rewarded:
-        # Atomically credit the referrer with 1 ₹500 voucher
-        await db.users.update_one(
-            {"referral_code": referred_by},
-            {"$inc": {"referral_credits": 1}},
-        )
-        await db.users.update_one(
-            {"user_id": user.user_id},
-            {"$set": {"referral_rewarded": True}},
-        )
+    # First-time payment by this user → reward the referrer + give referee 1 free watermarked DPR.
+    await _award_referral_if_first_paid(user_doc)
 
     # Audit log
     await db.payment_logs.insert_one({
@@ -1238,6 +1243,12 @@ async def create_project(payload: ProjectCreate, user: User = Depends(get_curren
         industry_template=payload.industry_template or "",
         projections=[YearProjection(year=i + 1) for i in range(years)],
     )
+    # Apply finance defaults from payload (interest rate / tenure / moratorium)
+    project.means_of_finance.interest_rate = float(payload.interest_rate or 11.0)
+    project.means_of_finance.loan_tenure_years = int(payload.loan_tenure_years or 7)
+    project.means_of_finance.moratorium_months = int(payload.moratorium_months or 6)
+    if project.loan_amount and project.loan_amount > 0:
+        project.means_of_finance.term_loan = float(project.loan_amount)
 
     # Auto-set subsidy % from scheme master
     scheme = _find_scheme(payload.loan_scheme)
@@ -1252,6 +1263,8 @@ async def create_project(payload: ProjectCreate, user: User = Depends(get_curren
 
     # Apply auto-subsidy from %
     _autocompute_subsidy(project)
+    # Auto-fill yearly interest from amortization schedule
+    _apply_interest_to_projections(project)
 
     doc = project.model_dump()
     doc["created_at"] = now.isoformat()
@@ -1338,6 +1351,89 @@ def _autocompute_subsidy(project: Project):
         project.means_of_finance.subsidy = subsidy_amt
 
 
+async def _award_referral_if_first_paid(user_doc: dict) -> None:
+    """If this is the user's first paid project AND they were referred,
+    credit the referrer ₹200 wallet, give the referee 1 free watermarked DPR,
+    and mark `referral_rewarded=True` to make it one-time. Idempotent.
+    """
+    if not user_doc:
+        return
+    if user_doc.get("referral_rewarded"):
+        return
+    referred_by = (user_doc or {}).get("referred_by") or ""
+    if not referred_by:
+        return
+    paid_count = await db.projects.count_documents({
+        "user_id": user_doc.get("user_id"), "payment_status": "paid"
+    })
+    if paid_count != 1:
+        return
+    # Credit the referrer
+    await db.users.update_one(
+        {"referral_code": referred_by},
+        {"$inc": {"wallet_balance": 200.0}},
+    )
+    # Reward referee with 1 free watermarked DPR + mark rewarded
+    await db.users.update_one(
+        {"user_id": user_doc.get("user_id")},
+        {"$set": {"referral_rewarded": True}, "$inc": {"free_dpr_credits": 1}},
+    )
+
+
+def _yearly_interest_schedule(loan_amount: float, annual_rate: float,
+                              tenure_years: int, moratorium_months: int,
+                              projection_years: int) -> List[float]:
+    """Standard EMI-based amortization. Returns the yearly TOTAL interest paid
+    for each projection year (length = projection_years).
+    During moratorium, interest is accrued and PAID but no principal repayment.
+    After moratorium, regular EMIs cover both interest + principal.
+    """
+    out = [0.0] * max(1, projection_years)
+    if loan_amount <= 0 or annual_rate <= 0 or tenure_years <= 0:
+        return out
+    r = (annual_rate / 100.0) / 12.0  # monthly rate
+    n = max(1, tenure_years * 12)  # tenure in months
+    morat = max(0, int(moratorium_months or 0))
+    # During moratorium → no principal repayment, interest = loan * r each month
+    # After moratorium, n_remaining months of EMI on (still full) principal
+    n_emi = max(1, n - morat)
+    emi = loan_amount * r * ((1 + r) ** n_emi) / (((1 + r) ** n_emi) - 1) if r > 0 else (loan_amount / n_emi)
+
+    outstanding = loan_amount
+    total_months = projection_years * 12
+    for m in range(1, total_months + 1):
+        year_idx = (m - 1) // 12
+        if year_idx >= projection_years:
+            break
+        if m <= morat:
+            interest_this_month = outstanding * r
+            # No principal repayment during moratorium
+        else:
+            if outstanding <= 0:
+                continue
+            interest_this_month = outstanding * r
+            principal_this_month = max(0.0, emi - interest_this_month)
+            outstanding = max(0.0, outstanding - principal_this_month)
+        out[year_idx] += round(interest_this_month, 2)
+    return [round(x, 2) for x in out]
+
+
+def _apply_interest_to_projections(project: Project):
+    """Recalculate the per-year `interest` value for each projection from the
+    loan amount/rate/tenure in means_of_finance. Skips if no loan_amount.
+    """
+    rate = float(project.means_of_finance.interest_rate or 0)
+    tenure = int(project.means_of_finance.loan_tenure_years or 0)
+    morat = int(project.means_of_finance.moratorium_months or 0)
+    years = project.projection_years or len(project.projections) or 5
+    schedule = _yearly_interest_schedule(
+        project.loan_amount or 0.0, rate, tenure, morat, years
+    )
+    for i, p in enumerate(project.projections):
+        if i < len(schedule):
+            p.interest = schedule[i]
+
+
 @api_router.post("/projects/{project_id}/auto-project", response_model=Project)
 async def auto_project(project_id: str, payload: AutoProjectRequest, user: User = Depends(get_current_user)):
     """Auto-generate projections.
@@ -1385,6 +1481,9 @@ async def auto_project(project_id: str, payload: AutoProjectRequest, user: User 
         if not tpl:
             raise HTTPException(status_code=400, detail="Select an industry template first for a new business")
         _apply_industry_template(project, tpl)
+
+    # Apply yearly interest auto-calculation from loan amount × rate × tenure
+    _apply_interest_to_projections(project)
 
     update_doc = project.model_dump()
     update_doc["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -1539,26 +1638,25 @@ async def update_project(project_id: str, payload: ProjectUpdate, user: User = D
             mof = {**mof, "subsidy": round(loan_amt * pct / 100, 0)}
             update_data["means_of_finance"] = mof
 
-    # Auto-populate interest in each projection year from term loan
-    if "means_of_finance" in update_data and "projections" not in update_data:
-        mof = update_data["means_of_finance"]
+    # Auto-populate interest in each projection year using proper amortization schedule.
+    # Triggered when loan_amount, means_of_finance, or projection_years changes.
+    triggers = {"means_of_finance", "loan_amount", "projection_years", "projections"}
+    if triggers & set(update_data.keys()) and "projections" in {*update_data.keys(), *merged.keys()}:
+        mof = merged.get("means_of_finance") or {}
         if isinstance(mof, dict):
-            tl = float(mof.get("term_loan") or 0)
-            rate = float(mof.get("interest_rate") or 0)
+            tl = float(mof.get("term_loan") or merged.get("loan_amount") or 0)
+            rate = float(mof.get("interest_rate") or 11.0)
             tenure = int(mof.get("loan_tenure_years") or 7)
-            moratorium = (mof.get("moratorium_months") or 0) / 12
+            morat = int(mof.get("moratorium_months") or 0)
+            years = int(merged.get("projection_years") or len(merged.get("projections") or []) or 5)
+            projections = update_data.get("projections") or merged.get("projections") or []
             if tl > 0 and rate > 0:
-                # Year-wise outstanding principal-based interest (declining)
-                projections = merged.get("projections") or []
-                annual_repay = tl / max(tenure, 1)
-                principal_outstanding = tl
+                schedule = _yearly_interest_schedule(tl, rate, tenure, morat, years)
                 updated_projections = []
                 for i, pr in enumerate(projections):
                     pr_copy = dict(pr) if isinstance(pr, dict) else pr
-                    if (i + 1) > moratorium:
-                        principal_outstanding = max(0, principal_outstanding - annual_repay)
-                    yr_interest = round(principal_outstanding * rate / 100, 0)
-                    pr_copy["interest"] = yr_interest
+                    if i < len(schedule):
+                        pr_copy["interest"] = schedule[i]
                     updated_projections.append(pr_copy)
                 update_data["projections"] = updated_projections
 
@@ -2538,6 +2636,451 @@ async def download_pdf(project_id: str, user: User = Depends(get_current_user)):
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# ============================== ADMIN LOGIN (SEPARATE) + QUICK BUY (GUEST) ==============================
+
+class QuickBuyRequest(BaseModel):
+    name: str = Field(..., min_length=2, max_length=120)
+    email: EmailStr
+    mobile: str = Field(..., min_length=7, max_length=15)
+
+
+@api_router.post("/auth/quick-buy", response_model=AuthResponse)
+async def quick_buy_signup(req: QuickBuyRequest):
+    """Create a passwordless GUEST account so a visitor can buy a DPR at ₹799 without registering.
+    If the email already belongs to a real (non-guest) account, asks them to log in.
+    """
+    mobile = "".join(c for c in req.mobile if c.isdigit())
+    if len(mobile) < 7:
+        raise HTTPException(status_code=400, detail="Valid mobile number required")
+    email = str(req.email).lower()
+    existing = await db.users.find_one({"email": email}, {"_id": 0})
+    now = datetime.now(timezone.utc)
+
+    if existing and not existing.get("is_guest"):
+        raise HTTPException(
+            status_code=400,
+            detail="This email already has an account. Please sign in instead.",
+        )
+
+    if existing and existing.get("is_guest"):
+        # Re-use the guest account so they don't accumulate orphan rows
+        user_id = existing["user_id"]
+        await db.users.update_one(
+            {"user_id": user_id},
+            {"$set": {"name": req.name, "mobile": mobile}},
+        )
+        refreshed = await db.users.find_one({"user_id": user_id}, {"_id": 0}) or existing
+        if isinstance(refreshed.get("created_at"), str):
+            refreshed["created_at"] = datetime.fromisoformat(refreshed["created_at"])
+        token = create_jwt(user_id)
+        return AuthResponse(user=User(**refreshed), token=token)
+
+    user_id = f"guest_{uuid.uuid4().hex[:12]}"
+    referral_code = f"MBDS-{uuid.uuid4().hex[:6].upper()}"
+    user_doc = {
+        "user_id": user_id,
+        "email": email,
+        "name": req.name,
+        "mobile": mobile,
+        "picture": None,
+        "auth_provider": "guest",
+        "password_hash": "",  # passwordless
+        "referral_code": referral_code,
+        "referred_by": "",
+        "referral_credits": 0,
+        "free_dpr_credits": 0,
+        "wallet_balance": 0.0,
+        "is_guest": True,
+        "is_admin": False,
+        "created_at": now.isoformat(),
+    }
+    await db.users.insert_one(user_doc)
+    token = create_jwt(user_id)
+    return AuthResponse(
+        user=User(user_id=user_id, email=email, name=req.name,
+                  auth_provider="guest", referral_code=referral_code,
+                  referred_by="", free_dpr_credits=0, wallet_balance=0.0,
+                  is_guest=True, is_admin=False, created_at=now),
+        token=token,
+    )
+
+
+@api_router.post("/auth/admin-login", response_model=AuthResponse)
+async def admin_login(req: LoginRequest):
+    """Admin-only login endpoint. Rejects non-admin credentials so admins can't accidentally
+    log in via the public user page and vice versa."""
+    user_doc = await db.users.find_one({"email": req.email.lower()}, {"_id": 0})
+    if not user_doc or not user_doc.get("password_hash"):
+        raise HTTPException(status_code=401, detail="Invalid admin credentials")
+    if not verify_password(req.password, user_doc["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid admin credentials")
+
+    email_lower = user_doc.get("email", "").lower()
+    # Auto-promote configured admin emails
+    if email_lower in ADMIN_EMAILS and not user_doc.get("is_admin"):
+        await db.users.update_one({"user_id": user_doc["user_id"]}, {"$set": {"is_admin": True}})
+        user_doc["is_admin"] = True
+
+    if not (user_doc.get("is_admin") or email_lower in ADMIN_EMAILS):
+        raise HTTPException(status_code=403, detail="Not an admin account")
+
+    if isinstance(user_doc.get("created_at"), str):
+        user_doc["created_at"] = datetime.fromisoformat(user_doc["created_at"])
+    token = create_jwt(user_doc["user_id"])
+    return AuthResponse(user=User(**user_doc), token=token)
+
+
+# ============================== WALLET ==============================
+
+class WalletTopupRequest(BaseModel):
+    txn_id: str
+    amount: float
+    method: str = "GPay"
+
+
+@api_router.get("/wallet/me")
+async def wallet_me(user: User = Depends(get_current_user)):
+    user_doc = await db.users.find_one({"user_id": user.user_id}, {"_id": 0})
+    txns = await db.wallet_txns.find(
+        {"user_id": user.user_id}, {"_id": 0}
+    ).sort("created_at", -1).to_list(100)
+    settings = await get_company_settings()
+    return {
+        "balance": float((user_doc or {}).get("wallet_balance", 0)),
+        "free_dpr_credits": int((user_doc or {}).get("free_dpr_credits", 0)),
+        "referral_credits": int((user_doc or {}).get("referral_credits", 0)),
+        "bulk_price": int(settings["referral_price_inr"]),
+        "transactions": txns,
+    }
+
+
+@api_router.post("/wallet/topup")
+async def wallet_topup(payload: WalletTopupRequest, user: User = Depends(get_current_user)):
+    """User submits a UPI top-up transaction. Pending verification by admin.
+    Balance is credited immediately but flagged 'pending' so admin can reverse it if needed.
+    """
+    if not payload.txn_id or len(payload.txn_id.strip()) < 4:
+        raise HTTPException(status_code=400, detail="Valid transaction ID required")
+    if payload.amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be greater than 0")
+
+    now = datetime.now(timezone.utc)
+    txn = {
+        "txn_uid": str(uuid.uuid4()),
+        "user_id": user.user_id,
+        "user_email": user.email,
+        "type": "topup",
+        "amount": float(payload.amount),
+        "txn_id": payload.txn_id.strip(),
+        "method": payload.method,
+        "status": "pending",
+        "created_at": now.isoformat(),
+    }
+    await db.wallet_txns.insert_one(dict(txn))
+    # Credit balance now (optimistic). Admin can reverse if not verified.
+    await db.users.update_one(
+        {"user_id": user.user_id},
+        {"$inc": {"wallet_balance": float(payload.amount)}},
+    )
+    new_doc = await db.users.find_one({"user_id": user.user_id}, {"_id": 0, "wallet_balance": 1})
+    return {"ok": True, "balance": float(new_doc.get("wallet_balance", 0))}
+
+
+@api_router.post("/projects/{project_id}/pay-from-wallet", response_model=Project)
+async def pay_from_wallet(project_id: str, user: User = Depends(get_current_user)):
+    """Pay for a project using wallet balance — no UPI/transaction needed."""
+    doc = await db.projects.find_one({"project_id": project_id, "user_id": user.user_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if doc.get("payment_status") == "paid":
+        raise HTTPException(status_code=400, detail="Already paid")
+
+    user_doc = await db.users.find_one({"user_id": user.user_id}, {"_id": 0})
+    is_guest = bool((user_doc or {}).get("is_guest", False))
+    settings = await get_company_settings()
+    # Guests would pay 799, logged-in users 599
+    price = int(settings["price_inr"]) if is_guest else int(settings["referral_price_inr"])
+
+    balance = float((user_doc or {}).get("wallet_balance", 0))
+    if balance < price:
+        raise HTTPException(
+            status_code=402,
+            detail=f"Insufficient wallet balance. Need ₹{price}, you have ₹{balance:.0f}",
+        )
+
+    now = datetime.now(timezone.utc)
+    # Deduct from wallet
+    await db.users.update_one(
+        {"user_id": user.user_id},
+        {"$inc": {"wallet_balance": -price}},
+    )
+    # Mark project paid
+    await db.projects.update_one(
+        {"project_id": project_id, "user_id": user.user_id},
+        {"$set": {
+            "payment_status": "paid",
+            "payment_txn_id": f"WALLET-{uuid.uuid4().hex[:8].upper()}",
+            "payment_amount": float(price),
+            "payment_method": "Wallet",
+            "paid_at": now.isoformat(),
+            "updated_at": now.isoformat(),
+        }},
+    )
+    # Wallet txn record
+    await db.wallet_txns.insert_one({
+        "txn_uid": str(uuid.uuid4()),
+        "user_id": user.user_id,
+        "user_email": user.email,
+        "type": "debit",
+        "amount": float(price),
+        "project_id": project_id,
+        "status": "verified",
+        "created_at": now.isoformat(),
+    })
+    # Payment log (so admin can see it)
+    await db.payment_logs.insert_one({
+        "log_id": str(uuid.uuid4()),
+        "user_id": user.user_id,
+        "user_email": user.email,
+        "project_id": project_id,
+        "txn_id": f"WALLET-{uuid.uuid4().hex[:8].upper()}",
+        "amount": float(price),
+        "expected_price": price,
+        "method": "Wallet",
+        "submitted_at": now.isoformat(),
+        "verification_status": "verified",
+        "verified_by": "wallet-auto",
+        "verified_at": now.isoformat(),
+        "used_referral_credit": False,
+    })
+    # Reward referrer + give referee free watermarked DPR if first paid project
+    await _award_referral_if_first_paid(user_doc)
+
+    new_doc = await db.projects.find_one({"project_id": project_id, "user_id": user.user_id}, {"_id": 0})
+    return Project(**_serialize_project(new_doc))
+
+
+# ============================== ADMIN: WALLET MANAGEMENT ==============================
+
+class AdminWalletCredit(BaseModel):
+    user_email: EmailStr
+    amount: float
+    note: Optional[str] = ""
+
+
+@api_router.post("/admin/wallet/credit")
+async def admin_wallet_credit(payload: AdminWalletCredit, admin: User = Depends(require_admin)):
+    """Admin can credit/debit any user's wallet (use negative amount to debit)."""
+    target = await db.users.find_one({"email": payload.user_email.lower()}, {"_id": 0})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    await db.users.update_one(
+        {"user_id": target["user_id"]},
+        {"$inc": {"wallet_balance": float(payload.amount)}},
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    await db.wallet_txns.insert_one({
+        "txn_uid": str(uuid.uuid4()),
+        "user_id": target["user_id"],
+        "user_email": target["email"],
+        "type": "admin_credit" if payload.amount > 0 else "admin_debit",
+        "amount": float(payload.amount),
+        "status": "verified",
+        "note": payload.note or "",
+        "admin_email": admin.email,
+        "created_at": now,
+    })
+    new_doc = await db.users.find_one({"user_id": target["user_id"]}, {"_id": 0, "wallet_balance": 1, "email": 1})
+    return {"ok": True, "email": new_doc["email"], "balance": float(new_doc["wallet_balance"])}
+
+
+@api_router.get("/admin/users")
+async def admin_list_users(_: User = Depends(require_admin)):
+    rows = await db.users.find(
+        {}, {"_id": 0, "password_hash": 0, "tokens_invalidated_before": 0}
+    ).sort("created_at", -1).to_list(500)
+    for r in rows:
+        if isinstance(r.get("created_at"), str):
+            r["created_at"] = r["created_at"]
+    return rows
+
+
+@api_router.get("/admin/wallet/txns")
+async def admin_wallet_txns(_: User = Depends(require_admin)):
+    rows = await db.wallet_txns.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    return rows
+
+
+# ============================== FREE WATERMARKED DPR ==============================
+
+def _watermark_canvas(canvas, doc):
+    """Draw a diagonal watermark on every page of the PDF."""
+    canvas.saveState()
+    canvas.setFont("Helvetica-Bold", 60)
+    canvas.setFillColorRGB(0.85, 0.85, 0.85)
+    canvas.translate(105 * mm, 148 * mm)
+    canvas.rotate(45)
+    canvas.drawCentredString(0, 0, "DPRForge SAMPLE")
+    canvas.setFont("Helvetica", 14)
+    canvas.drawCentredString(0, -22, "www.dprforge.com — Upgrade to remove watermark")
+    canvas.restoreState()
+
+
+@api_router.get("/projects/{project_id}/download/free-watermarked-pdf")
+async def download_free_watermarked_pdf(project_id: str, user: User = Depends(get_current_user)):
+    """Download a watermarked sample PDF — uses 1 free_dpr_credits from referral signup."""
+    doc = await db.projects.find_one({"project_id": project_id, "user_id": user.user_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Project not found")
+    user_doc = await db.users.find_one({"user_id": user.user_id}, {"_id": 0})
+    free_credits = int((user_doc or {}).get("free_dpr_credits", 0))
+    if free_credits <= 0 and doc.get("payment_status") != "paid":
+        raise HTTPException(
+            status_code=402,
+            detail="No free DPR credits available. Sign up with a referral code to get 1 free watermarked DPR, or pay to unlock.",
+        )
+
+    p = Project(**_serialize_project(doc))
+    summary = compute_year_summary(p)
+
+    buf = io.BytesIO()
+    pdf = SimpleDocTemplate(buf, pagesize=A4,
+                            leftMargin=18 * mm, rightMargin=18 * mm,
+                            topMargin=20 * mm, bottomMargin=18 * mm)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("Title", parent=styles["Heading1"],
+                                 fontSize=22, textColor=colors.HexColor("#0F172A"),
+                                 spaceAfter=4, alignment=1)
+    sub_style = ParagraphStyle("Sub", parent=styles["Normal"],
+                               fontSize=11, textColor=colors.HexColor("#475569"),
+                               alignment=1, spaceAfter=18)
+    h2 = ParagraphStyle("H2", parent=styles["Heading2"],
+                        fontSize=14, textColor=colors.HexColor("#1D4ED8"),
+                        spaceBefore=14, spaceAfter=8)
+    body = ParagraphStyle("Body", parent=styles["Normal"],
+                          fontSize=10, leading=14, textColor=colors.HexColor("#0F172A"))
+
+    story = [
+        Paragraph("DETAILED PROJECT REPORT (SAMPLE)", title_style),
+        Paragraph(p.business_name or "Untitled Project", sub_style),
+        Paragraph("FREE PREVIEW — generated by DPRForge", body),
+        Spacer(1, 8),
+        Paragraph("Business Snapshot", h2),
+    ]
+    snap_data = [
+        ["Business Name", p.business_name or "-", "Scheme", p.loan_scheme or "-"],
+        ["Type", p.business_type or "-", "Loan Amount", f"₹{p.loan_amount:,.0f}"],
+        ["Location", p.location or "-", "Years", str(p.projection_years)],
+    ]
+    snap = Table(snap_data, colWidths=[28 * mm, 60 * mm, 28 * mm, 60 * mm])
+    snap.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#F1F5F9")),
+        ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#F1F5F9")),
+        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+        ("FONTNAME", (2, 0), (2, -1), "Helvetica-Bold"),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CBD5E1")),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+    ]))
+    story.append(snap)
+
+    # Year summary
+    if summary:
+        story.append(Spacer(1, 12))
+        story.append(Paragraph("Projected P&L Summary", h2))
+        ys_header = ["Year", "Revenue", "EBITDA", "PAT"]
+        ys_rows = [ys_header]
+        for row in summary[:5]:
+            ys_rows.append([
+                f"Y{row['year']}",
+                f"{row['revenue']:,.0f}",
+                f"{row['ebitda']:,.0f}",
+                f"{row['net_profit']:,.0f}",
+            ])
+        ys = Table(ys_rows, repeatRows=1)
+        ys.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0F172A")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#CBD5E1")),
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
+        ]))
+        story.append(ys)
+
+    story.append(Spacer(1, 16))
+    story.append(Paragraph(
+        "<b>This is a FREE watermarked sample.</b> To download a clean, bank-ready DPR + CMA Excel "
+        "report, please pay ₹599 (logged-in price) from your wallet or via UPI on the preview page.",
+        body))
+    story.append(Spacer(1, 4))
+    story.append(Paragraph(
+        f"<i>Generated on {datetime.now(timezone.utc).strftime('%d %B %Y')} via DPRForge — www.dprforge.com</i>",
+        ParagraphStyle("Foot", parent=body, alignment=1, textColor=colors.HexColor("#94A3B8"), fontSize=8)))
+
+    pdf.build(story, onFirstPage=_watermark_canvas, onLaterPages=_watermark_canvas)
+
+    # Consume one free credit (only if not already paid)
+    if doc.get("payment_status") != "paid":
+        await db.users.update_one(
+            {"user_id": user.user_id, "free_dpr_credits": {"$gt": 0}},
+            {"$inc": {"free_dpr_credits": -1}},
+        )
+
+    buf.seek(0)
+    filename = f"DPR_Sample_{p.business_name or 'project'}.pdf".replace(" ", "_")
+    return StreamingResponse(
+        buf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ============================== STARTUP: SEED ADMIN ==============================
+
+@app.on_event("startup")
+async def seed_admin_on_startup():
+    """Ensure the configured admin account exists with a working password. Idempotent."""
+    seed_email = (os.environ.get("ADMIN_SEED_EMAIL") or "").strip().lower()
+    seed_password = os.environ.get("ADMIN_SEED_PASSWORD") or ""
+    seed_name = os.environ.get("ADMIN_SEED_NAME") or "Admin"
+    if not seed_email or not seed_password:
+        return
+    try:
+        existing = await db.users.find_one({"email": seed_email}, {"_id": 0})
+        now = datetime.now(timezone.utc).isoformat()
+        if not existing:
+            user_id = f"user_{uuid.uuid4().hex[:12]}"
+            await db.users.insert_one({
+                "user_id": user_id,
+                "email": seed_email,
+                "name": seed_name,
+                "picture": None,
+                "auth_provider": "email",
+                "password_hash": hash_password(seed_password),
+                "referral_code": f"MBDS-{uuid.uuid4().hex[:6].upper()}",
+                "referred_by": "",
+                "referral_credits": 0,
+                "free_dpr_credits": 0,
+                "wallet_balance": 0.0,
+                "is_admin": True,
+                "created_at": now,
+            })
+            logger.info(f"[seed] Created admin account: {seed_email}")
+        else:
+            # Always reset password to seed value on startup, ensure is_admin=True
+            await db.users.update_one(
+                {"user_id": existing["user_id"]},
+                {"$set": {
+                    "password_hash": hash_password(seed_password),
+                    "is_admin": True,
+                    "name": existing.get("name") or seed_name,
+                }},
+            )
+            logger.info(f"[seed] Refreshed admin credentials: {seed_email}")
+    except Exception as e:
+        logger.warning(f"[seed] Failed to seed admin: {e}")
 
 
 # ============================== APP SETUP ==============================
