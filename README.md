@@ -1,31 +1,29 @@
-# DPRForge Backend (Hostinger Python App)
+# DPRForge Backend — Railway Deployment
 
-## Files
-- `server.py` — FastAPI application
-- `passenger_wsgi.py` — Hostinger Passenger entry point (wraps FastAPI in WSGI)
-- `requirements.txt` — Python dependencies (Hostinger-compatible)
-- `runtime.txt` — Python version (3.11)
-- `.env.example` — Copy to `.env` and fill in real values
+## Quick deploy to Railway
 
-## Hostinger Python App settings
-- **Python version**: 3.11
-- **Application startup file**: `passenger_wsgi.py`
-- **Application entry point**: `application`
+1. Create a new Railway project and connect this repo (or upload this folder).
+2. Add the **MongoDB plugin** in Railway (or paste a MongoDB Atlas URI).
+3. Set the environment variables from `.env.example` in the Railway "Variables" tab.
+   - **CRITICAL**: `JWT_SECRET` must be a long random string (use `openssl rand -hex 32`).
+   - `MONGO_URL` is auto-injected when you add Railway's MongoDB plugin.
+4. Railway auto-detects the `Procfile` and runs:
+   ```
+   uvicorn server:app --host 0.0.0.0 --port $PORT
+   ```
+5. After deploy, visit `https://<your-app>.up.railway.app/api/company` — should return JSON.
 
-## Install dependencies (via SSH)
-```
-source ~/virtualenv/dprforge-backend/3.11/bin/activate
-cd ~/dprforge-backend
-pip install -r requirements.txt
-```
+## Admin login
+- Auto-seeded on every boot from `ADMIN_SEED_EMAIL` + `ADMIN_SEED_PASSWORD`.
+- Default: `motherblessopc@gmail.com` / `Admin1234`.
+- The seed RESETS the password on every restart — change `ADMIN_SEED_PASSWORD` and redeploy to rotate.
 
-## Environment variables — create `.env` file in this folder with:
-```
-MONGO_URL=mongodb+srv://USER:PASS@cluster.mongodb.net/dprforge?retryWrites=true&w=majority
-DB_NAME=dprforge
-CORS_ORIGINS=https://dprforge.com,https://www.dprforge.com
-JWT_SECRET=long-random-string-here
-ADMIN_EMAILS=owner@dprforge.com
-```
-
-See top-level `HOSTINGER-SETUP.md` for full step-by-step.
+## Endpoints quick reference
+- `POST /api/auth/login` — regular user login
+- `POST /api/auth/admin-login` — admin-only login (separate portal)
+- `POST /api/auth/quick-buy` — guest signup (₹799 one-time)
+- `GET  /api/projects/{id}/pricing` — returns 799 for guests, 599 for logged-in
+- `POST /api/projects/{id}/pay-from-wallet` — debit wallet for project
+- `GET  /api/projects/{id}/download/free-watermarked-pdf` — uses 1 free_dpr_credit
+- `POST /api/admin/wallet/credit` — admin can credit any user's wallet
+- `POST /api/admin/settings` — admin can change prices
