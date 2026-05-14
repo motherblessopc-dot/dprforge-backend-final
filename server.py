@@ -3087,13 +3087,28 @@ async def seed_admin_on_startup():
 
 app.include_router(api_router)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# CORS — supports both:
+#   1. Explicit comma-separated list: CORS_ORIGINS="https://dprforge.com,https://www.dprforge.com"
+#   2. Wildcard "*" — falls back to allow_origin_regex so credentials still work
+_cors_env = os.environ.get('CORS_ORIGINS', '*').strip()
+if _cors_env == '*' or _cors_env == '':
+    # Browsers reject wildcard origin + credentials. Use regex match-all instead.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_credentials=True,
+        allow_origin_regex=".*",
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    _origins = [o.strip().rstrip("/") for o in _cors_env.split(',') if o.strip()]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_credentials=True,
+        allow_origins=_origins,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 logging.basicConfig(
     level=logging.INFO,
