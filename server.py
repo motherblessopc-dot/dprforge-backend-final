@@ -723,6 +723,8 @@ _EDITABLE_KEYS = {
     "upi_id", "upi_name", "qr_image_url", "price_inr", "referral_price_inr",
     "payment_methods", "primary_phone", "whatsapp",
     "razorpay_key_id", "razorpay_key_secret", "razorpay_enabled",
+    # Company / office address (editable from Admin panel)
+    "name", "address_line1", "address_line2", "city", "state", "pincode", "country", "email",
 }
 
 # Default list of accepted payment methods (admin can edit)
@@ -1075,6 +1077,15 @@ class SettingsUpdate(BaseModel):
     razorpay_key_id: Optional[str] = None
     razorpay_key_secret: Optional[str] = None
     razorpay_enabled: Optional[bool] = None
+    # Company / office address (admin editable)
+    name: Optional[str] = None
+    address_line1: Optional[str] = None
+    address_line2: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    pincode: Optional[str] = None
+    country: Optional[str] = None
+    email: Optional[str] = None
 
 
 @api_router.get("/admin/settings")
