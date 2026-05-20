@@ -38,3 +38,4 @@ qrcode[pil]>=7.4.2
 #     This package is on a custom index — if your Railway build fails because
 #     of this line, just keep it commented out.
 # emergentintegrations>=0.1.0
+razorpay==2.0.1

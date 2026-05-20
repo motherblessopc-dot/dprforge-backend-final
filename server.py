@@ -48,6 +48,56 @@ db = client[os.environ['DB_NAME']]
 
 JWT_SECRET = os.environ.get('JWT_SECRET', 'change-me')
 JWT_ALGO = "HS256"
+
+# ===== Cashfree =====
+CASHFREE_APP_ID = os.environ.get("CASHFREE_APP_ID", "")
+CASHFREE_SECRET_KEY = os.environ.get("CASHFREE_SECRET_KEY", "")
+CASHFREE_ENV = os.environ.get("CASHFREE_ENV", "production").lower()
+CASHFREE_API_VERSION = os.environ.get("CASHFREE_API_VERSION", "2025-01-01")
+CASHFREE_BASE_URL = "https://sandbox.cashfree.com/pg" if CASHFREE_ENV == "sandbox" else "https://api.cashfree.com/pg"
+FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "").rstrip("/")
+
+# ===== Brute-force protection (in-memory) =====
+# email -> {"count": int, "locked_until": datetime}
+_LOGIN_ATTEMPTS: Dict[str, Dict[str, Any]] = {}
+LOGIN_MAX_ATTEMPTS = 5
+LOGIN_LOCKOUT_MINUTES = 10
+
+def _check_login_lockout(email: str) -> None:
+    rec = _LOGIN_ATTEMPTS.get(email.lower())
+    if not rec:
+        return
+    locked_until = rec.get("locked_until")
+    if locked_until and datetime.now(timezone.utc) < locked_until:
+        remaining = int((locked_until - datetime.now(timezone.utc)).total_seconds() / 60) + 1
+        raise HTTPException(status_code=429, detail=f"Too many failed login attempts. Try again in {remaining} minute(s).")
+
+def _register_failed_login(email: str) -> None:
+    key = email.lower()
+    rec = _LOGIN_ATTEMPTS.get(key, {"count": 0, "locked_until": None})
+    rec["count"] = rec.get("count", 0) + 1
+    if rec["count"] >= LOGIN_MAX_ATTEMPTS:
+        rec["locked_until"] = datetime.now(timezone.utc) + timedelta(minutes=LOGIN_LOCKOUT_MINUTES)
+        rec["count"] = 0  # reset counter after lockout starts
+    _LOGIN_ATTEMPTS[key] = rec
+
+def _clear_login_attempts(email: str) -> None:
+    _LOGIN_ATTEMPTS.pop(email.lower(), None)
+
+# ===== Simple in-memory rate limiter (per IP, per route bucket) =====
+# bucket-key -> [(timestamp, count)] ; uses sliding minute window
+_RATE_BUCKETS: Dict[str, List[float]] = {}
+
+def rate_limit(request: Request, bucket: str, max_per_minute: int = 30) -> None:
+    ip = (request.client.host if request.client else "anon") or "anon"
+    key = f"{bucket}:{ip}"
+    now = datetime.now(timezone.utc).timestamp()
+    window_start = now - 60.0
+    arr = [t for t in _RATE_BUCKETS.get(key, []) if t > window_start]
+    if len(arr) >= max_per_minute:
+        raise HTTPException(status_code=429, detail=f"Rate limit exceeded for {bucket}. Try again shortly.")
+    arr.append(now)
+    _RATE_BUCKETS[key] = arr
 EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY', '')
 
 app = FastAPI(title="Loan DPR & CMA API")
@@ -69,6 +119,7 @@ class User(BaseModel):
     wallet_balance: float = 0.0  # INR balance — usable to pay for DPRs
     is_guest: bool = False  # true for no-password "Quick Buy" accounts; pricing falls back to base_price
     is_admin: bool = False
+    is_founding_ca: bool = False  # First 100 signups + admin badge → 50% off CMA forever
     is_blocked: bool = False  # admin can block a user; blocked users cannot login or access API
     mobile: Optional[str] = ""
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -451,6 +502,15 @@ async def register(req: RegisterRequest):
 
     is_admin = req.email.lower() in ADMIN_EMAILS
 
+    # Founding-CA badge: auto-assign to first 100 signups (CMA promotion — lifetime 50% off)
+    is_founding_ca = False
+    try:
+        total_users = await db.users.count_documents({})
+        if total_users < 100:
+            is_founding_ca = True
+    except Exception:
+        is_founding_ca = False
+
     user_doc = {
         "user_id": user_id,
         "email": req.email.lower(),
@@ -465,6 +525,7 @@ async def register(req: RegisterRequest):
         "wallet_balance": 0.0,
         "is_guest": False,
         "is_admin": is_admin,
+        "is_founding_ca": is_founding_ca,
         "is_blocked": False,
         "created_at": now.isoformat(),
     }
@@ -474,17 +535,21 @@ async def register(req: RegisterRequest):
         user=User(user_id=user_id, email=req.email.lower(), name=req.name,
                   auth_provider="email", referral_code=referral_code,
                   referred_by=referred_by, free_dpr_credits=0,
-                  is_admin=is_admin, created_at=now),
+                  is_admin=is_admin, is_founding_ca=is_founding_ca, created_at=now),
         token=token,
     )
 
 
 @api_router.post("/auth/login", response_model=AuthResponse)
-async def login(req: LoginRequest):
+async def login(req: LoginRequest, request: Request):
+    rate_limit(request, "login", max_per_minute=20)
+    _check_login_lockout(req.email)
     user_doc = await db.users.find_one({"email": req.email.lower()}, {"_id": 0})
     if not user_doc or not user_doc.get("password_hash"):
+        _register_failed_login(req.email)
         raise HTTPException(status_code=401, detail="Invalid credentials")
     if not verify_password(req.password, user_doc["password_hash"]):
+        _register_failed_login(req.email)
         raise HTTPException(status_code=401, detail="Invalid credentials")
     if user_doc.get("is_blocked"):
         raise HTTPException(status_code=403, detail="Your account has been blocked. Please contact support.")
@@ -498,6 +563,7 @@ async def login(req: LoginRequest):
     if isinstance(user_doc.get("created_at"), str):
         user_doc["created_at"] = datetime.fromisoformat(user_doc["created_at"])
     token = create_jwt(user_doc["user_id"])
+    _clear_login_attempts(req.email)
     return AuthResponse(user=User(**user_doc), token=token)
 
 
@@ -703,6 +769,8 @@ COMPANY_INFO = {
     "upi_id": "7300213623@okbizaxis",
     "upi_name": "Mother Bless Digital Solutions",
     "qr_image_url": "/payment-qr.jpg",
+    "gstin": "08KQRPS8229A1Z6",
+    "email": "motherblessopc@gmail.com",
     "price_inr": 799,
     "referral_price_inr": 599,
     "referral_reward_text": "Refer a friend — when they sign up using your code, they get 1 free DPR (with DPRForge watermark). Their first paid DPR earns you a ₹200 wallet credit.",
@@ -723,6 +791,7 @@ _EDITABLE_KEYS = {
     "upi_id", "upi_name", "qr_image_url", "price_inr", "referral_price_inr",
     "payment_methods", "primary_phone", "whatsapp",
     "razorpay_key_id", "razorpay_key_secret", "razorpay_enabled",
+    "gstin",
     # Company / office address (editable from Admin panel)
     "name", "address_line1", "address_line2", "city", "state", "pincode", "country", "email",
 }
@@ -824,6 +893,33 @@ async def submit_payment(project_id: str, payload: PaymentSubmit, user: User = D
         "verified_at": None,
         "used_referral_credit": used_credit,
     })
+
+    # Auto-generate GST tax invoice (idempotent)
+    try:
+        from invoice_module import create_invoice_for_payment
+        await create_invoice_for_payment(
+            db,
+            kind="dpr",
+            ref_id=project_id,
+            user=user_doc or {"user_id": user.user_id, "email": user.email, "name": getattr(user, "name", "")},
+            amount_paid=float(payload.amount),
+            payment_method=payload.method,
+            payment_txn_id=payload.txn_id.strip(),
+            seller=settings,
+            buyer_state=(doc.get("applicant") or {}).get("state") or doc.get("state"),
+            buyer_name=(doc.get("applicant") or {}).get("full_name") or doc.get("business_name"),
+            buyer_address=", ".join([
+                x for x in [
+                    (doc.get("applicant") or {}).get("address_line1"),
+                    (doc.get("applicant") or {}).get("address_line2"),
+                    (doc.get("applicant") or {}).get("city"),
+                    (doc.get("applicant") or {}).get("state"),
+                    (doc.get("applicant") or {}).get("pincode"),
+                ] if x
+            ]),
+        )
+    except Exception as _inv_err:
+        logging.getLogger(__name__).warning(f"[invoice] DPR invoice generation failed: {_inv_err}")
 
     new_doc = await db.projects.find_one({"project_id": project_id, "user_id": user.user_id}, {"_id": 0})
     return Project(**_serialize_project(new_doc))
@@ -1164,6 +1260,449 @@ async def admin_unblock_user(user_id: str, admin: User = Depends(require_admin))
     await db.users.update_one({"user_id": user_id}, {"$set": {"is_blocked": False}})
     await log_admin_action(admin, "user.unblock", "user", user_id, {"email": target.get("email")})
     return {"ok": True, "user_id": user_id, "is_blocked": False}
+
+
+@api_router.post("/admin/users/{user_id}/toggle-founding-ca")
+async def admin_toggle_founding_ca(user_id: str, admin: User = Depends(require_admin)):
+    """Manually toggle the Founding-CA badge for a user (lifetime 50% off CMA)."""
+    target = await db.users.find_one({"user_id": user_id}, {"_id": 0})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    new_val = not bool(target.get("is_founding_ca", False))
+    await db.users.update_one({"user_id": user_id}, {"$set": {"is_founding_ca": new_val}})
+    await log_admin_action(admin, "user.toggle_founding_ca", "user", user_id, {"email": target.get("email"), "is_founding_ca": new_val})
+    return {"ok": True, "user_id": user_id, "is_founding_ca": new_val}
+
+
+# =============================== NEWS / UPDATES ===============================
+
+@api_router.get("/news")
+async def list_news():
+    """Public — fetch all published news items."""
+    cursor = db.news.find({"published": True}, {"_id": 0}).sort("published_at", -1).limit(50)
+    return [doc async for doc in cursor]
+
+
+@api_router.get("/admin/news")
+async def admin_list_news(admin: User = Depends(require_admin)):
+    """Admin — fetch ALL news items (incl. drafts)."""
+    cursor = db.news.find({}, {"_id": 0}).sort("created_at", -1)
+    return [doc async for doc in cursor]
+
+
+@api_router.post("/admin/news")
+async def admin_create_news(payload: Dict[str, Any], admin: User = Depends(require_admin)):
+    title = (payload.get("title") or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="title required")
+    news_id = f"news_{uuid.uuid4().hex[:10]}"
+    now_iso = datetime.now(timezone.utc).isoformat()
+    doc = {
+        "news_id": news_id,
+        "title": title,
+        "summary": (payload.get("summary") or "").strip(),
+        "body": (payload.get("body") or "").strip(),
+        "category": payload.get("category") or "Announcement",  # Announcement / Update / Tutorial / Promo
+        "image_url": payload.get("image_url") or "",
+        "published": bool(payload.get("published", True)),
+        "published_at": now_iso if payload.get("published", True) else None,
+        "created_at": now_iso,
+        "created_by": admin.email,
+    }
+    await db.news.insert_one(doc)
+    doc.pop("_id", None)
+    return {"ok": True, "news_id": news_id, "item": doc}
+
+
+@api_router.put("/admin/news/{news_id}")
+async def admin_update_news(news_id: str, payload: Dict[str, Any], admin: User = Depends(require_admin)):
+    update = {k: v for k, v in payload.items() if k in ("title", "summary", "body", "category", "image_url", "published")}
+    if "published" in update and update["published"] and not (await db.news.find_one({"news_id": news_id, "published_at": {"$ne": None}})):
+        update["published_at"] = datetime.now(timezone.utc).isoformat()
+    update["updated_at"] = datetime.now(timezone.utc).isoformat()
+    res = await db.news.update_one({"news_id": news_id}, {"$set": update})
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="news not found")
+    return {"ok": True}
+
+
+@api_router.delete("/admin/news/{news_id}")
+async def admin_delete_news(news_id: str, admin: User = Depends(require_admin)):
+    res = await db.news.delete_one({"news_id": news_id})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="news not found")
+    return {"ok": True}
+
+
+# =============================== MESSAGE TEMPLATES (WhatsApp ready replies) ===============================
+
+@api_router.get("/admin/message-templates")
+async def admin_list_templates(_: User = Depends(require_admin)):
+    rows = await db.message_templates.find({}, {"_id": 0}).sort("created_at", -1).to_list(200)
+    return rows
+
+
+@api_router.post("/admin/message-templates")
+async def admin_create_template(payload: Dict[str, Any], admin: User = Depends(require_admin)):
+    name = (payload.get("name") or "").strip()
+    body = (payload.get("body") or "").strip()
+    if not name or not body:
+        raise HTTPException(status_code=400, detail="name and body required")
+    tpl_id = f"tpl_{uuid.uuid4().hex[:10]}"
+    now = datetime.now(timezone.utc).isoformat()
+    doc = {
+        "template_id": tpl_id,
+        "name": name,
+        "body": body,
+        "category": (payload.get("category") or "Loan Inquiry").strip(),
+        "channel": (payload.get("channel") or "whatsapp").strip(),  # whatsapp / sms / email
+        "created_at": now,
+        "updated_at": now,
+        "created_by": admin.email,
+    }
+    await db.message_templates.insert_one(doc)
+    doc.pop("_id", None)
+    await log_admin_action(admin, "template.create", "template", tpl_id, {"name": name})
+    return {"ok": True, "template_id": tpl_id, "item": doc}
+
+
+@api_router.put("/admin/message-templates/{template_id}")
+async def admin_update_template(template_id: str, payload: Dict[str, Any], admin: User = Depends(require_admin)):
+    update = {k: v for k, v in payload.items() if k in ("name", "body", "category", "channel")}
+    if not update:
+        raise HTTPException(status_code=400, detail="nothing to update")
+    update["updated_at"] = datetime.now(timezone.utc).isoformat()
+    res = await db.message_templates.update_one({"template_id": template_id}, {"$set": update})
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="template not found")
+    await log_admin_action(admin, "template.update", "template", template_id, {"fields": list(update.keys())})
+    return {"ok": True}
+
+
+@api_router.delete("/admin/message-templates/{template_id}")
+async def admin_delete_template(template_id: str, admin: User = Depends(require_admin)):
+    res = await db.message_templates.delete_one({"template_id": template_id})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="template not found")
+    await log_admin_action(admin, "template.delete", "template", template_id, {})
+    return {"ok": True}
+
+
+# =============================== SERVICE-AREA LOCATIONS ===============================
+
+@api_router.get("/locations")
+async def public_list_locations():
+    """Public — list active service-area locations (footer / contact page)."""
+    rows = await db.locations.find({"is_active": True}, {"_id": 0}).sort("sort_order", 1).to_list(100)
+    return rows
+
+
+@api_router.get("/admin/locations")
+async def admin_list_locations(_: User = Depends(require_admin)):
+    rows = await db.locations.find({}, {"_id": 0}).sort("sort_order", 1).to_list(100)
+    return rows
+
+
+@api_router.post("/admin/locations")
+async def admin_create_location(payload: Dict[str, Any], admin: User = Depends(require_admin)):
+    city = (payload.get("city") or "").strip()
+    if not city:
+        raise HTTPException(status_code=400, detail="city required")
+    loc_id = f"loc_{uuid.uuid4().hex[:10]}"
+    now = datetime.now(timezone.utc).isoformat()
+    doc = {
+        "location_id": loc_id,
+        "city": city,
+        "state": (payload.get("state") or "").strip(),
+        "address_line1": (payload.get("address_line1") or "").strip(),
+        "address_line2": (payload.get("address_line2") or "").strip(),
+        "pincode": (payload.get("pincode") or "").strip(),
+        "phone": (payload.get("phone") or "").strip(),
+        "manager_name": (payload.get("manager_name") or "").strip(),
+        "is_active": bool(payload.get("is_active", True)),
+        "sort_order": int(payload.get("sort_order") or 0),
+        "created_at": now,
+        "updated_at": now,
+    }
+    await db.locations.insert_one(doc)
+    doc.pop("_id", None)
+    await log_admin_action(admin, "location.create", "location", loc_id, {"city": city})
+    return {"ok": True, "location_id": loc_id, "item": doc}
+
+
+@api_router.put("/admin/locations/{location_id}")
+async def admin_update_location(location_id: str, payload: Dict[str, Any], admin: User = Depends(require_admin)):
+    allowed = {"city", "state", "address_line1", "address_line2", "pincode", "phone", "manager_name", "is_active", "sort_order"}
+    update = {k: v for k, v in payload.items() if k in allowed}
+    if not update:
+        raise HTTPException(status_code=400, detail="nothing to update")
+    if "sort_order" in update:
+        update["sort_order"] = int(update["sort_order"] or 0)
+    update["updated_at"] = datetime.now(timezone.utc).isoformat()
+    res = await db.locations.update_one({"location_id": location_id}, {"$set": update})
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="location not found")
+    await log_admin_action(admin, "location.update", "location", location_id, {"fields": list(update.keys())})
+    return {"ok": True}
+
+
+@api_router.delete("/admin/locations/{location_id}")
+async def admin_delete_location(location_id: str, admin: User = Depends(require_admin)):
+    res = await db.locations.delete_one({"location_id": location_id})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="location not found")
+    await log_admin_action(admin, "location.delete", "location", location_id, {})
+    return {"ok": True}
+
+
+# =============================== CMA EMAIL OPT-IN ===============================
+
+class CMASubscribeRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    email: EmailStr
+    name: Optional[str] = ""
+    role: Optional[str] = ""  # CA / MSME / Bank Officer / Other
+    source: Optional[str] = "landing"
+
+
+@api_router.post("/cma/subscribe")
+async def cma_subscribe(payload: CMASubscribeRequest, request: Request):
+    """Public endpoint — collect emails for CMA-launch / pricing-change notifications."""
+    email = str(payload.email).lower()
+    existing = await db.cma_subscribers.find_one({"email": email}, {"_id": 0})
+    if existing:
+        # Idempotent — just refresh timestamps
+        await db.cma_subscribers.update_one(
+            {"email": email},
+            {"$set": {
+                "name": (payload.name or existing.get("name") or "").strip(),
+                "role": (payload.role or existing.get("role") or "").strip(),
+                "last_seen_at": datetime.now(timezone.utc).isoformat(),
+            }},
+        )
+        return {"ok": True, "subscribed": True, "is_new": False}
+    doc = {
+        "subscriber_id": f"sub_{uuid.uuid4().hex[:10]}",
+        "email": email,
+        "name": (payload.name or "").strip(),
+        "role": (payload.role or "").strip(),
+        "source": payload.source or "landing",
+        "ip": (request.client.host if request.client else ""),
+        "user_agent": request.headers.get("user-agent", "")[:300],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.cma_subscribers.insert_one(doc)
+    return {"ok": True, "subscribed": True, "is_new": True}
+
+
+@api_router.get("/admin/cma-subscribers")
+async def admin_list_subscribers(_: User = Depends(require_admin), limit: int = 500):
+    limit = max(1, min(int(limit or 500), 5000))
+    rows = await db.cma_subscribers.find({}, {"_id": 0}).sort("created_at", -1).to_list(limit)
+    return rows
+
+
+@api_router.get("/admin/cma-subscribers/count")
+async def admin_subscribers_count(_: User = Depends(require_admin)):
+    total = await db.cma_subscribers.count_documents({})
+    return {"total": total}
+
+
+# =============================== CASHFREE PAYMENT GATEWAY ===============================
+
+class CashfreeOrderRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    purpose: Literal["dpr_purchase", "wallet_topup", "cma_purchase", "custom"]
+    amount: float  # ₹ — must be > 0
+    customer_name: Optional[str] = ""
+    customer_email: EmailStr
+    customer_phone: str
+    project_id: Optional[str] = None
+    notes: Optional[str] = ""
+
+
+async def _cashfree_request(method: str, path: str, json_body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Server-side call to Cashfree PG API. Never expose secret to client."""
+    if not CASHFREE_APP_ID or not CASHFREE_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Cashfree not configured. Contact admin.")
+    import httpx
+    headers = {
+        "x-api-version": CASHFREE_API_VERSION,
+        "x-client-id": CASHFREE_APP_ID,
+        "x-client-secret": CASHFREE_SECRET_KEY,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    url = f"{CASHFREE_BASE_URL}{path}"
+    async with httpx.AsyncClient(timeout=15.0) as client_http:
+        if method == "POST":
+            resp = await client_http.post(url, json=json_body or {}, headers=headers)
+        else:
+            resp = await client_http.get(url, headers=headers)
+    if resp.status_code >= 400:
+        try:
+            err = resp.json()
+        except Exception:
+            err = {"detail": resp.text[:300]}
+        raise HTTPException(status_code=400, detail=f"Cashfree: {err.get('message') or err.get('error_description') or err}")
+    return resp.json()
+
+
+@api_router.post("/cashfree/create-order")
+async def cashfree_create_order(req: CashfreeOrderRequest, request: Request):
+    rate_limit(request, "cashfree-create", max_per_minute=20)
+    # Try to fetch user if authenticated (optional — guests allowed)
+    user = None
+    try:
+        user = await get_current_user(request, None)
+    except Exception:
+        pass
+    if req.amount <= 0 or req.amount > 1_00_00_000:
+        raise HTTPException(status_code=400, detail="Invalid amount")
+
+    order_id = f"DPR_{uuid.uuid4().hex[:14].upper()}"
+    customer_id = (user.user_id if user else f"guest_{uuid.uuid4().hex[:10]}")
+    return_url = f"{FRONTEND_BASE_URL}/payment-status?order_id={{order_id}}"
+    notify_url = f"{FRONTEND_BASE_URL}/api/cashfree/webhook"
+
+    payload = {
+        "order_id": order_id,
+        "order_amount": round(float(req.amount), 2),
+        "order_currency": "INR",
+        "customer_details": {
+            "customer_id": customer_id,
+            "customer_phone": req.customer_phone,
+            "customer_email": str(req.customer_email),
+            "customer_name": req.customer_name or "Customer",
+        },
+        "order_meta": {
+            "return_url": return_url,
+            "notify_url": notify_url,
+        },
+        "order_note": (req.notes or req.purpose)[:200],
+    }
+
+    cf = await _cashfree_request("POST", "/orders", payload)
+
+    doc = {
+        "cashfree_order_id": cf.get("order_id") or order_id,
+        "cf_order_id": cf.get("cf_order_id"),
+        "payment_session_id": cf.get("payment_session_id"),
+        "amount": round(float(req.amount), 2),
+        "currency": "INR",
+        "purpose": req.purpose,
+        "project_id": req.project_id,
+        "customer_id": customer_id,
+        "customer_email": str(req.customer_email),
+        "customer_phone": req.customer_phone,
+        "status": "CREATED",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "raw_create_response": cf,
+    }
+    await db.cashfree_orders.insert_one(doc)
+    return {
+        "ok": True,
+        "order_id": doc["cashfree_order_id"],
+        "payment_session_id": doc["payment_session_id"],
+        "amount": doc["amount"],
+        "mode": CASHFREE_ENV,
+    }
+
+
+@api_router.get("/cashfree/order/{order_id}")
+async def cashfree_order_status(order_id: str, request: Request):
+    rate_limit(request, "cashfree-status", max_per_minute=60)
+    local = await db.cashfree_orders.find_one({"cashfree_order_id": order_id}, {"_id": 0})
+    cf = await _cashfree_request("GET", f"/orders/{order_id}")
+    order_status = cf.get("order_status") or "UNKNOWN"
+    # update local
+    if local:
+        new_local_status = "PAID" if order_status == "PAID" else ("FAILED" if order_status in ("EXPIRED", "TERMINATED") else local.get("status", "CREATED"))
+        await db.cashfree_orders.update_one(
+            {"cashfree_order_id": order_id},
+            {"$set": {"status": new_local_status, "last_synced_at": datetime.now(timezone.utc).isoformat()}},
+        )
+    return {
+        "order_id": order_id,
+        "cashfree_status": order_status,
+        "amount": (local or {}).get("amount"),
+        "currency": "INR",
+        "purpose": (local or {}).get("purpose"),
+    }
+
+
+@api_router.post("/cashfree/webhook")
+async def cashfree_webhook(request: Request):
+    """Receive payment status updates from Cashfree. Verifies HMAC signature."""
+    import hmac, hashlib, base64, json as _json
+    signature = request.headers.get("x-webhook-signature", "")
+    timestamp = request.headers.get("x-webhook-timestamp", "")
+    raw_body = await request.body()
+    if not signature or not timestamp or not CASHFREE_SECRET_KEY:
+        raise HTTPException(status_code=400, detail="Missing headers or config")
+
+    message = timestamp.encode("utf-8") + raw_body
+    digest = hmac.new(CASHFREE_SECRET_KEY.encode("utf-8"), message, hashlib.sha256).digest()
+    expected = base64.b64encode(digest).decode("utf-8")
+    if not hmac.compare_digest(expected, signature):
+        logger.warning(f"Cashfree webhook signature mismatch from {request.client.host if request.client else '?'}")
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    try:
+        payload = _json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    event_type = payload.get("type") or ""
+    data = payload.get("data", {}) or {}
+    order_info = data.get("order", {}) or {}
+    payment_info = data.get("payment", {}) or {}
+    order_id = order_info.get("order_id")
+
+    if not order_id:
+        return {"ok": True, "ignored": True}
+
+    if event_type == "PAYMENT_SUCCESS_WEBHOOK" or payment_info.get("payment_status") == "SUCCESS":
+        new_status = "PAID"
+    elif event_type in ("PAYMENT_FAILED_WEBHOOK",) or payment_info.get("payment_status") in ("FAILED",):
+        new_status = "FAILED"
+    elif event_type in ("PAYMENT_USER_DROPPED_WEBHOOK",):
+        new_status = "DROPPED"
+    else:
+        new_status = "UPDATED"
+
+    await db.cashfree_orders.update_one(
+        {"cashfree_order_id": order_id},
+        {"$set": {
+            "status": new_status,
+            "webhook_event": event_type,
+            "webhook_payload": payload,
+            "webhook_received_at": datetime.now(timezone.utc).isoformat(),
+        }},
+        upsert=False,
+    )
+    # If purchase succeeded and we have a linked project_id, mark project as paid
+    if new_status == "PAID":
+        order_doc = await db.cashfree_orders.find_one({"cashfree_order_id": order_id}, {"_id": 0})
+        if order_doc and order_doc.get("project_id"):
+            await db.projects.update_one(
+                {"project_id": order_doc["project_id"]},
+                {"$set": {"is_paid": True, "payment_status": "verified", "payment_method": "cashfree",
+                          "paid_at": datetime.now(timezone.utc).isoformat()}},
+            )
+    return {"ok": True}
+
+
+@api_router.get("/cashfree/config")
+async def cashfree_public_config():
+    """Frontend needs to know mode (sandbox/production) to init JS SDK."""
+    return {
+        "enabled": bool(CASHFREE_APP_ID and CASHFREE_SECRET_KEY),
+        "mode": CASHFREE_ENV,
+    }
+
+
+# =============================== END CASHFREE ===============================
 
 
 @api_router.delete("/admin/users/{user_id}")
@@ -1599,7 +2138,10 @@ async def admin_export_sales_xlsx(
 
 
 
-def _ensure_paid(project: Project):
+def _ensure_paid(project: Project, user: Optional[User] = None):
+    # Admins bypass payment — admin can always generate DPR + CMA for free
+    if user is not None and getattr(user, "is_admin", False):
+        return
     if project.payment_status != "paid":
         raise HTTPException(
             status_code=402,
@@ -2576,7 +3118,7 @@ async def download_excel(project_id: str, user: User = Depends(get_current_user)
     if not doc:
         raise HTTPException(status_code=404, detail="Project not found")
     p = Project(**_serialize_project(doc))
-    _ensure_paid(p)
+    _ensure_paid(p, user)
     summary = compute_year_summary(p)
 
     wb = Workbook()
@@ -2820,7 +3362,7 @@ async def download_pdf(project_id: str, user: User = Depends(get_current_user)):
     if not doc:
         raise HTTPException(status_code=404, detail="Project not found")
     p = Project(**_serialize_project(doc))
-    _ensure_paid(p)
+    _ensure_paid(p, user)
     summary = compute_year_summary(p)
 
     buf = io.BytesIO()
@@ -3429,6 +3971,33 @@ async def pay_from_wallet(project_id: str, user: User = Depends(get_current_user
     # Reward referrer + give referee free watermarked DPR if first paid project
     await _award_referral_if_first_paid(user_doc)
 
+    # Auto-generate GST tax invoice (idempotent)
+    try:
+        from invoice_module import create_invoice_for_payment
+        await create_invoice_for_payment(
+            db,
+            kind="dpr",
+            ref_id=project_id,
+            user=user_doc or {"user_id": user.user_id, "email": user.email, "name": getattr(user, "name", "")},
+            amount_paid=float(price),
+            payment_method="Wallet",
+            payment_txn_id=f"WALLET-{project_id[:8]}",
+            seller=settings,
+            buyer_state=(doc.get("applicant") or {}).get("state") or doc.get("state"),
+            buyer_name=(doc.get("applicant") or {}).get("full_name") or doc.get("business_name"),
+            buyer_address=", ".join([
+                x for x in [
+                    (doc.get("applicant") or {}).get("address_line1"),
+                    (doc.get("applicant") or {}).get("address_line2"),
+                    (doc.get("applicant") or {}).get("city"),
+                    (doc.get("applicant") or {}).get("state"),
+                    (doc.get("applicant") or {}).get("pincode"),
+                ] if x
+            ]),
+        )
+    except Exception as _inv_err:
+        logging.getLogger(__name__).warning(f"[invoice] DPR wallet-invoice generation failed: {_inv_err}")
+
     new_doc = await db.projects.find_one({"project_id": project_id, "user_id": user.user_id}, {"_id": 0})
     return Project(**_serialize_project(new_doc))
 
@@ -3519,7 +4088,8 @@ async def download_free_watermarked_pdf(project_id: str, user: User = Depends(ge
         raise HTTPException(status_code=404, detail="Project not found")
     user_doc = await db.users.find_one({"user_id": user.user_id}, {"_id": 0})
     free_credits = int((user_doc or {}).get("free_dpr_credits", 0))
-    if free_credits <= 0 and doc.get("payment_status") != "paid":
+    is_admin_user = bool((user_doc or {}).get("is_admin", False))
+    if not is_admin_user and free_credits <= 0 and doc.get("payment_status") != "paid":
         raise HTTPException(
             status_code=402,
             detail="No free DPR credits available. Sign up with a referral code to get 1 free watermarked DPR, or pay to unlock.",
@@ -3604,8 +4174,8 @@ async def download_free_watermarked_pdf(project_id: str, user: User = Depends(ge
 
     pdf.build(story, onFirstPage=_watermark_canvas, onLaterPages=_watermark_canvas)
 
-    # Consume one free credit (only if not already paid)
-    if doc.get("payment_status") != "paid":
+    # Consume one free credit (only if not already paid AND not admin)
+    if not is_admin_user and doc.get("payment_status") != "paid":
         await db.users.update_one(
             {"user_id": user.user_id, "free_dpr_credits": {"$gt": 0}},
             {"$inc": {"free_dpr_credits": -1}},
@@ -3667,6 +4237,20 @@ async def seed_admin_on_startup():
 
 
 # ============================== APP SETUP ==============================
+
+# Mount CMA Data Preparation module (separate from DPR)
+try:
+    from cma_module import register_cma_routes  # type: ignore
+    register_cma_routes(api_router, db, get_current_user, User)
+except Exception as _e:
+    logging.getLogger(__name__).warning(f"[cma_module] not registered: {_e}")
+
+# Mount GST Tax Invoice module (auto-generated invoices for every paid txn)
+try:
+    from invoice_module import register_invoice_routes  # type: ignore
+    register_invoice_routes(api_router, db, get_current_user)
+except Exception as _e:
+    logging.getLogger(__name__).warning(f"[invoice_module] not registered: {_e}")
 
 app.include_router(api_router)
 
